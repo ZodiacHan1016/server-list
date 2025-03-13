@@ -22,10 +22,10 @@ jobs:
 
     - name: Convert config
       run: |
-        # 下载订阅
-        curl -s -o raw_sub.txt "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+        # 下载订阅（使用ghproxy镜像）
+        curl -s -o raw_sub.txt "https://ghproxy.com/https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
 
-        # 内联Python脚本（修复版）
+        # 内联Python完整脚本
         python3 <<EOF
         import yaml
         import base64
@@ -33,54 +33,48 @@ jobs:
         import requests
         import re
 
-        def safe_b64decode(data):
-            # 自动补全Base64填充
-            missing_padding = len(data) % 4
-            if missing_padding:
-                data += '=' * (4 - missing_padding)
-            # 处理URL安全编码
-            data = data.replace('-', '+').replace('_', '/')
-            return base64.b64decode(data)
+        # 定义规则获取函数
+        def fetch_ruleset(url):
+            try:
+                r = requests.get(url, timeout=15)
+                return [line.strip() for line in r.text.split('\n') 
+                        if line.strip() and not line.startswith('#')]
+            except Exception as e:
+                print(f"规则获取失败 {url}: {str(e)}")
+                return []
 
-        # 读取原始订阅
+        # 定义安全的Base64解码
+        def safe_b64decode(data):
+            # 清洗非Base64字符
+            cleaned = re.sub(r'[^a-zA-Z0-9+/=]', '', data)
+            # 处理URL安全编码
+            cleaned = cleaned.replace('-', '+').replace('_', '/')
+            # 自动填充
+            missing_padding = len(cleaned) % 4
+            if missing_padding:
+                cleaned += '=' * (4 - missing_padding)
+            try:
+                return base64.b64decode(cleaned).decode('utf-8')
+            except:
+                return data  # 返回原始数据
+
+        # 读取订阅内容
         with open('raw_sub.txt', 'r') as f:
             content = f.read().strip()
-            print(f"原始内容长度: {len(content)}")  # 调试日志
 
-        try:
-            # 改进的解码方式
-            decoded = safe_b64decode(content).decode('utf-8')
-            print("解码成功")  # 调试日志
-        except Exception as e:
-            print(f"解码失败: {str(e)}")
-            # 尝试直接使用原始内容
-            decoded = content
-            if not decoded:
-                raise ValueError("订阅内容为空")
-                
-        # Base64解码
-        decoded = base64.b64decode(content).decode('utf-8')
+        # 解码内容
+        decoded = safe_b64decode(content)
+        if not decoded.strip():
+            raise ValueError("订阅内容解码失败")
 
-        # 生成Clash配置框架
-        clash_config = {
-            'port': 7890,
-            'socks-port': 7891,
-            'mode': 'Rule',
-            'log-level': 'info',
-            'external-controller': '0.0.0.0:9090',
-            'proxies': [],
-            'proxy-groups': [],
-            'rules': []
-        }
-
-        # 解析节点配置
+        # 解析节点
         proxies = []
         for line in decoded.split('\n'):
             if line.startswith('vmess://'):
                 try:
                     config_str = base64.b64decode(line[8:]).decode('utf-8')
                     config = json.loads(config_str)
-                    proxy = {
+                    proxies.append({
                         'name': config['ps'],
                         'type': 'vmess',
                         'server': config['add'],
@@ -88,14 +82,13 @@ jobs:
                         'uuid': config['id'],
                         'alterId': config['aid'],
                         'cipher': 'auto'
-                    }
-                    proxies.append(proxy)
+                    })
                 except Exception as e:
-                    print(f"解析失败: {str(e)}")
+                    print(f"节点解析失败: {str(e)}")
 
-        # 构建完整代理组（兼容rule.ini）
+        # 构建代理组
         proxy_groups = [
-            # 主要代理组
+            # 核心组
             {
                 'name': '🚀 节点选择',
                 'type': 'select',
@@ -116,7 +109,13 @@ jobs:
                 'interval': 300,
                 'proxies': [p['name'] for p in proxies if '美' in p['name'] or 'US' in p['name']]
             },
-            # 其他地区组...
+            {
+                'name': '🌏 东亚地区',
+                'type': 'url-test',
+                'url': 'http://www.gstatic.com/generate_204',
+                'interval': 300,
+                'proxies': [p['name'] for p in proxies if any(kw in p['name'] for kw in ['港', 'HK', '日', 'JP', '台', 'TW'])]
+            },
             # 服务组
             {
                 'name': '📺 国外媒体',
@@ -141,52 +140,41 @@ jobs:
             }
         ]
 
-        # 动态规则源（增强REJECT/DIRECT规则）
+        # 构建规则
         rule_sources = {
-            # 直连规则
             'DIRECT': [
                 'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China.list',
                 'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaIP/ChinaIP.list'
             ],
-            # 代理规则
             'PROXY': [
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Proxy/Proxy.list',
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Global/Global.list'
+                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Proxy/Proxy.list'
             ],
-            # 拦截规则
             'REJECT': [
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Advertising/Advertising.list',
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Privacy/Privacy.list'
+                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Advertising/Advertising.list'
             ]
         }
 
-        # 构建规则链（优先级排序）
         rules = [
-            # 最高优先级：直连规则
             'GEOIP,CN,DIRECT',
             'DOMAIN-KEYWORD,edu,DIRECT',
             *[f'{rule},DIRECT' for url in rule_sources['DIRECT'] for rule in fetch_ruleset(url)],
-            
-            # 其次：代理规则
             *[f'{rule},🚀 节点选择' for url in rule_sources['PROXY'] for rule in fetch_ruleset(url)],
-            
-            # 然后：服务特定规则
-            'DOMAIN-SUFFIX,microsoft.com,Ⓜ️ 微软服务',
             'DOMAIN-SUFFIX,apple.com,DIRECT',
-            
-            # 拦截规则
             *[f'{rule},REJECT' for url in rule_sources['REJECT'] for rule in fetch_ruleset(url)],
-            
-            # 最终规则
-            'MATCH,🐟 漏网之鱼'  # 保持与rule.ini一致
+            'MATCH,🚀 节点选择'
         ]
 
-        # 合并配置
-        clash_config.update({
+        # 生成最终配置
+        clash_config = {
+            'port': 7890,
+            'socks-port': 7891,
+            'mode': 'Rule',
+            'log-level': 'info',
+            'external-controller': '0.0.0.0:9090',
             'proxies': proxies,
             'proxy-groups': proxy_groups,
             'rules': rules
-        })
+        }
 
         # 保存配置文件
         with open('./sub/config.yaml', 'w') as f:
