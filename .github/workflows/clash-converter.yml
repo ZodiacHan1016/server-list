@@ -23,7 +23,7 @@ jobs:
     - name: Convert config
       run: |
         # 下载订阅（使用ghproxy镜像）
-        curl -s -o raw_sub.txt "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+        curl -s -o raw_sub.txt "https://ghproxy.com/https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
 
         # 内联Python完整脚本
         python3 <<EOF
@@ -32,50 +32,57 @@ jobs:
         import json
         import requests
         import re
+        from collections import defaultdict
 
         # 定义规则获取函数
         def fetch_ruleset(url):
             try:
                 r = requests.get(url, timeout=15)
                 return [line.strip() for line in r.text.split('\n') 
-                        if line.strip() and not line.startswith('#')]
+                        if line.strip() and not line.startswith('#') and ',' in line]
             except Exception as e:
                 print(f"规则获取失败 {url}: {str(e)}")
                 return []
 
         # 定义安全的Base64解码
         def safe_b64decode(data):
-            # 清洗非Base64字符
             cleaned = re.sub(r'[^a-zA-Z0-9+/=]', '', data)
-            # 处理URL安全编码
             cleaned = cleaned.replace('-', '+').replace('_', '/')
-            # 自动填充
             missing_padding = len(cleaned) % 4
             if missing_padding:
                 cleaned += '=' * (4 - missing_padding)
             try:
                 return base64.b64decode(cleaned).decode('utf-8')
             except:
-                return data  # 返回原始数据
+                return data
 
-        # 读取订阅内容
-        with open('raw_sub.txt', 'r') as f:
-            content = f.read().strip()
-
-        # 解码内容
-        decoded = safe_b64decode(content)
-        if not decoded.strip():
-            raise ValueError("订阅内容解码失败")
-
-        # 解析节点
-        proxies = []
-        for line in decoded.split('\n'):
-            if line.startswith('vmess://'):
+        # 节点去重处理
+        def process_proxies(decoded):
+            seen = set()
+            proxies = []
+            duplicate_count = defaultdict(int)
+            
+            for line in decoded.split('\n'):
+                if not line.startswith('vmess://'):
+                    continue
+                
                 try:
                     config_str = base64.b64decode(line[8:]).decode('utf-8')
                     config = json.loads(config_str)
+                    original_name = config['ps']
+                    
+                    # 生成唯一名称
+                    counter = 1
+                    unique_name = original_name
+                    while unique_name in seen:
+                        duplicate_count[original_name] += 1
+                        unique_name = f"{original_name} ({duplicate_count[original_name]})"
+                        counter += 1
+                    
+                    seen.add(unique_name)
+                    
                     proxies.append({
-                        'name': config['ps'],
+                        'name': unique_name,
                         'type': 'vmess',
                         'server': config['add'],
                         'port': config['port'],
@@ -83,12 +90,30 @@ jobs:
                         'alterId': config['aid'],
                         'cipher': 'auto'
                     })
+                    
+                    if unique_name != original_name:
+                        print(f"发现重复节点: {original_name} => 重命名为 {unique_name}")
+
                 except Exception as e:
                     print(f"节点解析失败: {str(e)}")
+                    continue
+                    
+            print(f"共处理 {len(proxies)} 个节点，其中 {sum(duplicate_count.values())} 个重复节点已重命名")
+            return proxies
 
-        # 构建代理组
+        # 主处理流程
+        with open('raw_sub.txt', 'r') as f:
+            content = f.read().strip()
+
+        decoded = safe_b64decode(content)
+        if not decoded.strip():
+            raise ValueError("订阅内容解码失败")
+
+        # 处理节点（带去重）
+        proxies = process_proxies(decoded)
+        
+        # 构建完整代理组
         proxy_groups = [
-            # 核心组
             {
                 'name': '🚀 节点选择',
                 'type': 'select',
@@ -101,7 +126,6 @@ jobs:
                 'interval': 300,
                 'proxies': [p['name'] for p in proxies]
             },
-            # 地区组
             {
                 'name': '🌎 北美地区',
                 'type': 'url-test',
@@ -116,9 +140,8 @@ jobs:
                 'interval': 300,
                 'proxies': [p['name'] for p in proxies if any(kw in p['name'] for kw in ['港', 'HK', '日', 'JP', '台', 'TW'])]
             },
-            # 服务组
             {
-                'name': '📺 国外媒体',
+                'name': '📺 流媒体服务',
                 'type': 'select',
                 'proxies': ['🚀 节点选择', '🌎 北美地区', 'DIRECT']
             },
@@ -127,41 +150,62 @@ jobs:
                 'type': 'select',
                 'proxies': ['DIRECT', '🚀 节点选择']
             },
-            # 系统组
+            {
+                'name': '🍎 苹果服务',
+                'type': 'select',
+                'proxies': ['DIRECT', '🚀 节点选择']
+            },
             {
                 'name': '🎯 全球直连',
                 'type': 'select',
                 'proxies': ['DIRECT']
             },
             {
-                'name': '🛑 全球拦截',
+                'name': '🛑 广告拦截',
                 'type': 'select',
-                'proxies': ['REJECT', 'DIRECT']
+                'proxies': ['REJECT']
+            },
+            {
+                'name': '🐟 漏网之鱼',
+                'type': 'select',
+                'proxies': ['🚀 节点选择', 'DIRECT']
             }
         ]
 
-        # 构建规则
+        # 构建规则体系
         rule_sources = {
             'DIRECT': [
                 'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China.list',
                 'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaIP/ChinaIP.list'
             ],
             'PROXY': [
+                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Global/Global.list',
                 'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Proxy/Proxy.list'
             ],
             'REJECT': [
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Advertising/Advertising.list'
+                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Advertising/Advertising.list',
+                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Privacy/Privacy.list'
             ]
         }
 
         rules = [
+            # 直连规则
             'GEOIP,CN,DIRECT',
             'DOMAIN-KEYWORD,edu,DIRECT',
             *[f'{rule},DIRECT' for url in rule_sources['DIRECT'] for rule in fetch_ruleset(url)],
+            
+            # 代理规则
             *[f'{rule},🚀 节点选择' for url in rule_sources['PROXY'] for rule in fetch_ruleset(url)],
-            'DOMAIN-SUFFIX,apple.com,DIRECT',
-            *[f'{rule},REJECT' for url in rule_sources['REJECT'] for rule in fetch_ruleset(url)],
-            'MATCH,🚀 节点选择'
+            
+            # 服务专用规则
+            'DOMAIN-SUFFIX,apple.com,🍎 苹果服务',
+            'DOMAIN-SUFFIX,microsoft.com,Ⓜ️ 微软服务',
+            
+            # 拦截规则
+            *[f'{rule},🛑 广告拦截' for url in rule_sources['REJECT'] for rule in fetch_ruleset(url)],
+            
+            # 最终规则
+            'MATCH,🐟 漏网之鱼'
         ]
 
         # 生成最终配置
@@ -176,7 +220,6 @@ jobs:
             'rules': rules
         }
 
-        # 保存配置文件
         with open('./sub/config.yaml', 'w') as f:
             yaml.dump(clash_config, f, allow_unicode=True, sort_keys=False)
         EOF
@@ -185,7 +228,7 @@ jobs:
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
-        git pull origin main  # 修改为 main
+        git pull origin main
         git add ./sub/config.yaml
         git commit -m "Auto update Clash config [$(date +'%Y-%m-%d')]" || echo "No changes"
-        git push origin main  # 明确指定分支
+        git push origin main
