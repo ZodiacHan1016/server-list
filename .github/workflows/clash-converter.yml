@@ -2,7 +2,7 @@ name: Clash Config Converter
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天UTC时间0点执行
+    - cron: '0 0/6 * * *'  # 每天UTC时间0点执行
   workflow_dispatch:
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
     - name: Convert config
       run: |
         # 下载订阅（使用ghproxy镜像）
-        curl -s -o raw_sub.txt "https://ghproxy.com/https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+        curl -s -o raw_sub.txt "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
 
         # 内联Python完整脚本
         python3 <<EOF
@@ -76,7 +76,7 @@ jobs:
                     unique_name = original_name
                     while unique_name in seen:
                         duplicate_count[original_name] += 1
-                        unique_name = f"{original_name} ({duplicate_count[original_name]})"
+                        unique_name = f"{original_name} {duplicate_count[original_name]}"
                         counter += 1
                     
                     seen.add(unique_name)
