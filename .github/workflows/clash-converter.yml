@@ -196,23 +196,33 @@ jobs:
             ]
         }
 
+        # 修改后的规则处理函数
+        def format_rule(rule):
+            parts = rule.split(',')
+            if len(parts) < 3:
+                return rule
+            # 处理特殊参数
+            if 'no-resolve' in parts:
+                parts.remove('no-resolve')
+                parts.append('no-resolve')
+            # 确保策略在最后
+            if parts[-1] not in ['DIRECT', 'REJECT', '🚀 节点选择']:
+                for i, part in enumerate(parts):
+                    if part in ['DIRECT', 'REJECT', '🚀 节点选择']:
+                        policy = parts.pop(i)
+                        parts.append(policy)
+                        break
+            return ','.join(parts)
+
+        # 构建规则体系
         rules = [
-            # 直连规则
             'GEOIP,CN,DIRECT',
             'DOMAIN-KEYWORD,edu,DIRECT',
-            *[f'{rule},DIRECT' for url in rule_sources['DIRECT'] for rule in fetch_ruleset(url)],
-            
-            # 代理规则
-            *[f'{rule},🚀 节点选择' for url in rule_sources['PROXY'] for rule in fetch_ruleset(url)],
-            
-            # 服务专用规则
+            *[format_rule(rule) for url in rule_sources['DIRECT'] for rule in fetch_ruleset(url)],
+            *[format_rule(rule) for url in rule_sources['PROXY'] for rule in fetch_ruleset(url)],
             'DOMAIN-SUFFIX,apple.com,🍎 苹果服务',
             'DOMAIN-SUFFIX,microsoft.com,Ⓜ️ 微软服务',
-            
-            # 拦截规则
-            *[f'{rule},🛑 广告拦截' for url in rule_sources['REJECT'] for rule in fetch_ruleset(url)],
-            
-            # 最终规则
+            *[format_rule(rule) for url in rule_sources['REJECT'] for rule in fetch_ruleset(url)],
             'MATCH,🐟 漏网之鱼'
         ]
 
