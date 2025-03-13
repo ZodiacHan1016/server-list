@@ -185,7 +185,7 @@ jobs:
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
-        git pull origin master
+        git pull origin main  # 修改为 main
         git add ./sub/config.yaml
         git commit -m "Auto update Clash config [$(date +'%Y-%m-%d')]" || echo "No changes"
-        git push
+        git push origin main  # 明确指定分支
