@@ -112,7 +112,7 @@ jobs:
         # 处理节点（带去重）
         proxies = process_proxies(decoded)
         
-        # 构建完整代理组
+        # 构建完整代理组（修复版）
         proxy_groups = [
             {
                 'name': '🚀 节点选择',
@@ -124,21 +124,21 @@ jobs:
                 'type': 'url-test',
                 'url': 'http://www.gstatic.com/generate_204',
                 'interval': 300,
-                'proxies': [p['name'] for p in proxies]
+                'proxies': [p['name'] for p in proxies] if proxies else ['DIRECT']
             },
             {
                 'name': '🌎 北美地区',
                 'type': 'url-test',
                 'url': 'http://www.gstatic.com/generate_204',
                 'interval': 300,
-                'proxies': [p['name'] for p in proxies if '美' in p['name'] or 'US' in p['name']]
+                'proxies': [p['name'] for p in proxies if '美' in p['name'] or 'US' in p['name']] or ['DIRECT']
             },
             {
                 'name': '🌏 东亚地区',
                 'type': 'url-test',
                 'url': 'http://www.gstatic.com/generate_204',
                 'interval': 300,
-                'proxies': [p['name'] for p in proxies if any(kw in p['name'] for kw in ['港', 'HK', '日', 'JP', '台', 'TW'])]
+                'proxies': [p['name'] for p in proxies if any(kw in p['name'] for kw in ['港', 'HK', '日', 'JP', '台', 'TW'])] or ['DIRECT']
             },
             {
                 'name': '📺 流媒体服务',
@@ -171,6 +171,14 @@ jobs:
                 'proxies': ['🚀 节点选择', 'DIRECT']
             }
         ]
+
+        # 验证代理组配置
+        for group in proxy_groups:
+            if not group.get('proxies'):
+                print(f"警告: 代理组 {group['name']} 的proxies字段为空，已添加DIRECT")
+                group['proxies'].append('DIRECT')
+            if 'type' not in group:
+                raise ValueError(f"代理组 {group['name']} 缺少type字段")
 
         # 构建规则体系
         rule_sources = {
