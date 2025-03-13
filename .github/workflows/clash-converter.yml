@@ -23,7 +23,7 @@ jobs:
     - name: Convert config
       run: |
         # 下载订阅
-        curl -s -o raw_sub.txt "https://ghproxy.com/https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+        curl -s -o raw_sub.txt "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
 
         # 内联Python脚本（修复版）
         python3 <<EOF
