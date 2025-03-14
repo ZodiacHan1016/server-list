@@ -37,7 +37,8 @@ jobs:
     - name: Generate config
       run: |
         cd utils/subconverter
-        ./subconverter \
+        chmod +x subconverter-linux-amd64  # 添加执行权限
+        ./subconverter-linux-amd64 \       # 使用正确的文件名
           --artifact "clash" \
           --rule "config/rule.ini" \
           --pref "pref.ini" \
