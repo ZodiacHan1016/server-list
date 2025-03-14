@@ -1,252 +1,95 @@
-name: Clash Config Converter
+name: Clash Config Builder
 
 on:
-  schedule:
-    - cron: '0 0/6 * * *'  # 每天UTC时间0点执行
   workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'  # 每天UTC时间3点自动构建
 
 jobs:
-  convert-and-push:
+  build-config:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        submodules: recursive
 
-    - name: Install dependencies
-      run: pip install pyyaml requests
-
-    - name: Convert config
+    - name: Update subconverter
       run: |
-        # 下载订阅（使用ghproxy镜像）
-        curl -s -o raw_sub.txt "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+        git submodule update --init --remote utils/subconverter
+        cd utils/subconverter && git restore pref.ini  # 重置可能被修改的配置
 
-        # 内联Python完整脚本
-        python3 <<EOF
-        import yaml
-        import base64
-        import json
-        import requests
-        import re
-        from collections import defaultdict
-
-        # 定义规则获取函数
-        def fetch_ruleset(url):
-            try:
-                r = requests.get(url, timeout=15)
-                return [line.strip() for line in r.text.split('\n') 
-                        if line.strip() and not line.startswith('#') and ',' in line]
-            except Exception as e:
-                print(f"规则获取失败 {url}: {str(e)}")
-                return []
-
-        # 定义安全的Base64解码
-        def safe_b64decode(data):
-            cleaned = re.sub(r'[^a-zA-Z0-9+/=]', '', data)
-            cleaned = cleaned.replace('-', '+').replace('_', '/')
-            missing_padding = len(cleaned) % 4
-            if missing_padding:
-                cleaned += '=' * (4 - missing_padding)
-            try:
-                return base64.b64decode(cleaned).decode('utf-8')
-            except:
-                return data
-
-        # 节点去重处理
-        def process_proxies(decoded):
-            seen = set()
-            proxies = []
-            duplicate_count = defaultdict(int)
-            
-            for line in decoded.split('\n'):
-                if not line.startswith('vmess://'):
-                    continue
-                
-                try:
-                    config_str = base64.b64decode(line[8:]).decode('utf-8')
-                    config = json.loads(config_str)
-                    original_name = config['ps']
-                    
-                    # 生成唯一名称
-                    counter = 1
-                    unique_name = original_name
-                    while unique_name in seen:
-                        duplicate_count[original_name] += 1
-                        unique_name = f"{original_name} {duplicate_count[original_name]}"
-                        counter += 1
-                    
-                    seen.add(unique_name)
-                    
-                    proxies.append({
-                        'name': unique_name,
-                        'type': 'vmess',
-                        'server': config['add'],
-                        'port': config['port'],
-                        'uuid': config['id'],
-                        'alterId': config['aid'],
-                        'cipher': 'auto'
-                    })
-                    
-                    if unique_name != original_name:
-                        print(f"发现重复节点: {original_name} => 重命名为 {unique_name}")
-
-                except Exception as e:
-                    print(f"节点解析失败: {str(e)}")
-                    continue
-                    
-            print(f"共处理 {len(proxies)} 个节点，其中 {sum(duplicate_count.values())} 个重复节点已重命名")
-            return proxies
-
-        # 主处理流程
-        with open('raw_sub.txt', 'r') as f:
-            content = f.read().strip()
-
-        decoded = safe_b64decode(content)
-        if not decoded.strip():
-            raise ValueError("订阅内容解码失败")
-
-        # 处理节点（带去重）
-        proxies = process_proxies(decoded)
+    - name: Decode and prepare subscription
+      run: |
+        # 下载并解码订阅（对应pref.ini第14行insert_url）
+        curl -sL "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub" | base64 -d > nodes.txt
         
-        # 构建完整代理组（修复版）
-        proxy_groups = [
-            {
-                'name': '🚀 节点选择',
-                'type': 'select',
-                'proxies': ['♻️ 自动选择', 'DIRECT'] + [p['name'] for p in proxies]
-            },
-            {
-                'name': '♻️ 自动选择',
-                'type': 'url-test',
-                'url': 'http://www.gstatic.com/generate_204',
-                'interval': 300,
-                'proxies': [p['name'] for p in proxies] if proxies else ['DIRECT']
-            },
-            {
-                'name': '🌎 北美地区',
-                'type': 'url-test',
-                'url': 'http://www.gstatic.com/generate_204',
-                'interval': 300,
-                'proxies': [p['name'] for p in proxies if '美' in p['name'] or 'US' in p['name']] or ['DIRECT']
-            },
-            {
-                'name': '🌏 东亚地区',
-                'type': 'url-test',
-                'url': 'http://www.gstatic.com/generate_204',
-                'interval': 300,
-                'proxies': [p['name'] for p in proxies if any(kw in p['name'] for kw in ['港', 'HK', '日', 'JP', '台', 'TW'])] or ['DIRECT']
-            },
-            {
-                'name': '📺 流媒体服务',
-                'type': 'select',
-                'proxies': ['🚀 节点选择', '🌎 北美地区', 'DIRECT']
-            },
-            {
-                'name': 'Ⓜ️ 微软服务',
-                'type': 'select',
-                'proxies': ['DIRECT', '🚀 节点选择']
-            },
-            {
-                'name': '🍎 苹果服务',
-                'type': 'select',
-                'proxies': ['DIRECT', '🚀 节点选择']
-            },
-            {
-                'name': '🎯 全球直连',
-                'type': 'select',
-                'proxies': ['DIRECT']
-            },
-            {
-                'name': '🛑 广告拦截',
-                'type': 'select',
-                'proxies': ['REJECT']
-            },
-            {
-                'name': '🐟 漏网之鱼',
-                'type': 'select',
-                'proxies': ['🚀 节点选择', 'DIRECT']
-            }
-        ]
+        # 转换节点格式为subconverter可识别格式
+        awk '{print "vmess://" $0}' nodes.txt > utils/subconverter/input.txt
 
-        # 验证代理组配置
-        for group in proxy_groups:
-            if not group.get('proxies'):
-                print(f"警告: 代理组 {group['name']} 的proxies字段为空，已添加DIRECT")
-                group['proxies'].append('DIRECT')
-            if 'type' not in group:
-                raise ValueError(f"代理组 {group['name']} 缺少type字段")
-
-        # 构建规则体系
-        rule_sources = {
-            'DIRECT': [
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China.list',
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaIP/ChinaIP.list'
-            ],
-            'PROXY': [
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Global/Global.list',
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Proxy/Proxy.list'
-            ],
-            'REJECT': [
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Advertising/Advertising.list',
-                'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Privacy/Privacy.list'
-            ]
-        }
-
-        # 修改后的规则处理函数
-        def format_rule(rule):
-            parts = rule.split(',')
-            if len(parts) < 3:
-                return rule
-            # 处理特殊参数
-            if 'no-resolve' in parts:
-                parts.remove('no-resolve')
-                parts.append('no-resolve')
-            # 确保策略在最后
-            if parts[-1] not in ['DIRECT', 'REJECT', '🚀 节点选择']:
-                for i, part in enumerate(parts):
-                    if part in ['DIRECT', 'REJECT', '🚀 节点选择']:
-                        policy = parts.pop(i)
-                        parts.append(policy)
-                        break
-            return ','.join(parts)
-
-        # 构建规则体系
-        rules = [
-            'GEOIP,CN,DIRECT',
-            'DOMAIN-KEYWORD,edu,DIRECT',
-            *[format_rule(rule) for url in rule_sources['DIRECT'] for rule in fetch_ruleset(url)],
-            *[format_rule(rule) for url in rule_sources['PROXY'] for rule in fetch_ruleset(url)],
-            'DOMAIN-SUFFIX,apple.com,🍎 苹果服务',
-            'DOMAIN-SUFFIX,microsoft.com,Ⓜ️ 微软服务',
-            *[format_rule(rule) for url in rule_sources['REJECT'] for rule in fetch_ruleset(url)],
-            'MATCH,🐟 漏网之鱼'
-        ]
-
-        # 生成最终配置
-        clash_config = {
-            'port': 7890,
-            'socks-port': 7891,
-            'mode': 'Rule',
-            'log-level': 'info',
-            'external-controller': '0.0.0.0:9090',
-            'proxies': proxies,
-            'proxy-groups': proxy_groups,
-            'rules': rules
-        }
-
-        with open('./sub/config.yaml', 'w') as f:
-            yaml.dump(clash_config, f, allow_unicode=True, sort_keys=False)
-        EOF
-
-    - name: Commit and push
+    - name: Configure subconverter
       run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-        git pull origin main
-        git add ./sub/config.yaml
-        git commit -m "Auto update Clash config [$(date +'%Y-%m-%d')]" || echo "No changes"
-        git push origin main
+        # 启用规则生成器（rule.ini第36-37行）
+        sed -i "s/enable_rule_generator=.*/enable_rule_generator=true/" utils/subconverter/config/rule.ini
+        sed -i "s/overwrite_original_rules=.*/overwrite_original_rules=true/" utils/subconverter/config/rule.ini
+
+        # 配置订阅处理（pref.ini第12-16行）
+        sed -i "s/^enable_insert=.*/enable_insert=true/" utils/subconverter/pref.ini
+        sed -i "s|^insert_url=.*|insert_url=input.txt|" utils/subconverter/pref.ini
+        sed -i "s/^prepend_insert_url=.*/prepend_insert_url=true/" utils/subconverter/pref.ini
+
+        # 配置节点过滤（pref.ini第19/26行）
+        sed -i "s/^exclude_remarks=.*/exclude_remarks=(到期|剩余流量|时间|官网|产品|平台)/" utils/subconverter/pref.ini
+        sed -i "s/^enable_filter=.*/enable_filter=true/" utils/subconverter/pref.ini
+
+    - name: Generate config
+      run: |
+        cd utils/subconverter
+        ./subconverter \
+          --artifact "clash" \
+          --rule "config/rule.ini" \
+          --pref "pref.ini" \
+          --output "../../sub/config.yaml"
+        
+        # 添加生成元数据
+        echo -e "\n# Generated at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> ../../sub/config.yaml
+        echo "# Subconverter version: $(git rev-parse --short HEAD)" >> ../../sub/config.yaml
+
+    - name: Validate config
+      run: |
+        # 验证核心代理组（rule.ini第5行）
+        if ! grep -q '🚀 节点选择' sub/config.yaml; then
+          echo "::error::代理组生成失败"
+          exit 1
+        fi
+        
+        # 验证规则完整性（rule.ini第30/34行）
+        if ! grep -q 'GEOIP,CN' sub/config.yaml || ! grep -q 'MATCH' sub/config.yaml; then
+          echo "::error::规则集生成不完整"
+          exit 1
+        fi
+
+        # 验证节点注入（pref.ini第14行）
+        node_count=$(grep -c 'vmess://' sub/config.yaml)
+        if [ "$node_count" -lt 3 ]; then
+          echo "::error::节点注入数量不足"
+          exit 1
+        fi
+
+    - name: Archive config
+      uses: actions/upload-artifact@v3
+      with:
+        name: clash-config
+        path: |
+          sub/config.yaml
+          utils/subconverter/input.txt
+        retention-days: 3
+
+    - name: Create release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: sub/config.yaml
+        tag_name: config-$(date +%Y%m%d)
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
