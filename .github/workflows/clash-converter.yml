@@ -3,7 +3,7 @@ name: Clash Config Builder
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * *'  # 每天UTC时间3点自动构建
+    - cron: '0 0/6 * * *'  # 
 
 jobs:
   build-config:
@@ -17,28 +17,20 @@ jobs:
     - name: Update subconverter
       run: |
         git submodule update --init --remote utils/subconverter
-        cd utils/subconverter && git restore pref.ini  # 重置可能被修改的配置
+        cd utils/subconverter && git restore pref.ini
 
     - name: Decode and prepare subscription
       run: |
-        # 下载并解码订阅（对应pref.ini第14行insert_url）
         curl -sL "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub" | base64 -d > nodes.txt
-        
-        # 转换节点格式为subconverter可识别格式
         awk '{print "vmess://" $0}' nodes.txt > utils/subconverter/input.txt
 
     - name: Configure subconverter
       run: |
-        # 启用规则生成器（rule.ini第36-37行）
         sed -i "s/enable_rule_generator=.*/enable_rule_generator=true/" utils/subconverter/config/rule.ini
         sed -i "s/overwrite_original_rules=.*/overwrite_original_rules=true/" utils/subconverter/config/rule.ini
-
-        # 配置订阅处理（pref.ini第12-16行）
         sed -i "s/^enable_insert=.*/enable_insert=true/" utils/subconverter/pref.ini
         sed -i "s|^insert_url=.*|insert_url=input.txt|" utils/subconverter/pref.ini
         sed -i "s/^prepend_insert_url=.*/prepend_insert_url=true/" utils/subconverter/pref.ini
-
-        # 配置节点过滤（pref.ini第19/26行）
         sed -i "s/^exclude_remarks=.*/exclude_remarks=(到期|剩余流量|时间|官网|产品|平台)/" utils/subconverter/pref.ini
         sed -i "s/^enable_filter=.*/enable_filter=true/" utils/subconverter/pref.ini
 
@@ -50,34 +42,27 @@ jobs:
           --rule "config/rule.ini" \
           --pref "pref.ini" \
           --output "../../sub/config.yaml"
-        
-        # 添加生成元数据
         echo -e "\n# Generated at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> ../../sub/config.yaml
         echo "# Subconverter version: $(git rev-parse --short HEAD)" >> ../../sub/config.yaml
 
     - name: Validate config
       run: |
-        # 验证核心代理组（rule.ini第5行）
         if ! grep -q '🚀 节点选择' sub/config.yaml; then
           echo "::error::代理组生成失败"
           exit 1
         fi
-        
-        # 验证规则完整性（rule.ini第30/34行）
         if ! grep -q 'GEOIP,CN' sub/config.yaml || ! grep -q 'MATCH' sub/config.yaml; then
           echo "::error::规则集生成不完整"
           exit 1
         fi
-
-        # 验证节点注入（pref.ini第14行）
         node_count=$(grep -c 'vmess://' sub/config.yaml)
         if [ "$node_count" -lt 3 ]; then
           echo "::error::节点注入数量不足"
           exit 1
         fi
 
-    - name: Archive config
-      uses: actions/upload-artifact@v3
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
         name: clash-config
         path: |
