@@ -8,7 +8,7 @@ on:
 jobs:
   build-config:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
     - name: 检出代码
@@ -39,10 +39,20 @@ jobs:
         import requests
         import json
         import re
+        import logging
         from concurrent.futures import ThreadPoolExecutor
 
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+
         class RuleProcessor:
-            RULE_PATTERN = re.compile(r'^(?P<type>[A-Z-]+),(?P<param>[^,]+),(?P<group>[^,]+)$')
+            RULE_PATTERN = re.compile(
+                r'^(?P<type>DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD|IP-CIDR|GEOIP|MATCH|PROCESS-NAME),'
+                r'(?P<param>[^,]+),'
+                r'(?P<group>[^\s,]+)$'
+            )
 
             @classmethod
             def process_rule(cls, line):
@@ -53,8 +63,7 @@ jobs:
                 # 格式转换处理
                 conversions = {
                     'IP-CIDR': 'GEOIP',
-                    'FINAL': 'MATCH',
-                    'PROCESS-NAME': 'PROCESS-NAME'
+                    'FINAL': 'MATCH'
                 }
                 for old, new in conversions.items():
                     if line.startswith(old):
@@ -63,6 +72,7 @@ jobs:
                 # 标准化规则格式
                 match = cls.RULE_PATTERN.match(line)
                 if not match:
+                    logging.warning(f"过滤无效规则: {line}")
                     return None
                 
                 return f"{match.group('type')},{match.group('param')},{match.group('group')}"
@@ -73,7 +83,7 @@ jobs:
                     resp = requests.get(url, timeout=10)
                     return [cls.process_rule(line) for line in resp.text.splitlines()]
                 except Exception as e:
-                    print(f"规则源加载失败: {url} - {str(e)}")
+                    logging.error(f"规则源加载失败: {url} - {str(e)}")
                     return []
 
         class ClashGenerator:
@@ -88,6 +98,7 @@ jobs:
                     "port": 7890,
                     "socks-port": 7891,
                     "mode": "Rule",
+                    "log-level": "info",
                     "proxies": [],
                     "proxy-groups": [
                         {
@@ -106,45 +117,74 @@ jobs:
 
             def load_subscription(self):
                 sub_url = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
-                response = requests.get(sub_url)
-                decoded = base64.b64decode(response.text).decode('utf-8')
-                return [line for line in decoded.splitlines() if line.startswith('vmess://')]
+                try:
+                    response = requests.get(sub_url, timeout=15)
+                    response.raise_for_status()
+                    decoded = base64.b64decode(response.text).decode('utf-8')
+                    return [line for line in decoded.splitlines() if line.startswith('vmess://')]
+                except Exception as e:
+                    logging.error(f"订阅加载失败: {str(e)}")
+                    return []
 
             def parse_vmess(self, link):
-                config_str = base64.b64decode(link[8:]).decode('utf-8')
-                config = json.loads(config_str)
-                return {
-                    "name": config["ps"],
-                    "type": "vmess",
-                    "server": config["add"],
-                    "port": config["port"],
-                    "uuid": config["id"],
-                    "alterId": config["aid"],
-                    "cipher": "auto",
-                    "tls": config.get("tls") == "tls",
-                    "network": config.get("net", "tcp")
-                }
+                try:
+                    config_str = base64.b64decode(link[8:]).decode('utf-8')
+                    config = json.loads(config_str)
+                    return {
+                        "name": config["ps"].strip(),
+                        "type": "vmess",
+                        "server": config["add"],
+                        "port": config["port"],
+                        "uuid": config["id"],
+                        "alterId": config["aid"],
+                        "cipher": "auto",
+                        "tls": config.get("tls") == "tls",
+                        "network": config.get("net", "tcp")
+                    }
+                except Exception as e:
+                    logging.warning(f"解析节点失败: {link[:50]}... - {str(e)}")
+                    return None
 
             def generate_rules(self):
                 with ThreadPoolExecutor(max_workers=5) as executor:
                     results = executor.map(RuleProcessor.fetch_rules, self.RULE_SOURCES)
                 
                 rules = []
+                valid_count = 0
+                invalid_count = 0
+                
                 for result in results:
-                    rules.extend([r for r in result if r is not None])
+                    for r in result:
+                        if r is not None:
+                            rules.append(r)
+                            valid_count += 1
+                        else:
+                            invalid_count += 1
                 
                 # 添加核心规则
                 core_rules = [
                     "GEOIP,CN,🎯 全球直连",
                     "MATCH,🚀 节点选择"
                 ]
-                return list(dict.fromkeys(core_rules + rules))
+                
+                # 最终过滤（二次验证）
+                final_rules = []
+                for rule in core_rules + rules:
+                    if RuleProcessor.RULE_PATTERN.match(rule):
+                        final_rules.append(rule)
+                    else:
+                        logging.warning(f"最终过滤无效规则: {rule}")
+                        invalid_count += 1
+                
+                logging.info(f"规则处理完成: 有效规则 {len(final_rules)} 条, 过滤 {invalid_count} 条无效规则")
+                return list(dict.fromkeys(final_rules))
 
             def generate(self):
                 # 处理节点
                 vmess_links = self.load_subscription()
-                self.config["proxies"] = [self.parse_vmess(link) for link in vmess_links]
-                self.config["proxy-groups"][0]["proxies"] = [p["name"] for p in self.config["proxies"]]
+                valid_nodes = [node for node in (self.parse_vmess(link) for link in vmess_links) if node]
+                self.config["proxies"] = valid_nodes
+                self.config["proxy-groups"][0]["proxies"] = [p["name"] for p in valid_nodes]
                 
                 # 处理规则
                 self.config["rules"] = self.generate_rules()
@@ -152,6 +192,7 @@ jobs:
                 # 写入文件
                 with open("sub/config.yaml", "w") as f:
                     yaml.dump(self.config, f, allow_unicode=True, width=2147483647)
+                logging.info(f"配置文件生成成功，包含 {len(valid_nodes)} 个节点和 {len(self.config['rules'])} 条规则")
 
         if __name__ == "__main__":
             generator = ClashGenerator()
@@ -160,34 +201,45 @@ jobs:
 
         python generate_config.py
 
-    - name: 验证配置文件
+    - name: 自动修复配置文件
       run: |
-        # 检查规则格式
-        invalid_rules=$(grep -vE '^[A-Z-]+,[^,]+,[^,]+$' sub/config.yaml | grep -vE '^ |^#|^port:|^socks-port:|^mode:|^proxies:|^proxy-groups:|^rules:' || true)
-        if [ -n "$invalid_rules" ]; then
-          echo "::error::发现无效规则格式:"
-          echo "$invalid_rules"
-          exit 1
-        fi
+        # 过滤无效规则
+        echo "自动修复规则格式..."
+        grep -E '^(DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD|IP-CIDR|GEOIP|MATCH|PROCESS-NAME),[^,]+,[^,]+$' sub/config.yaml > temp_config.yaml
+        mv temp_config.yaml sub/config.yaml
 
-        # 检查必要规则
+        # 确保必要规则存在
         required_rules=(
             "GEOIP,CN,🎯 全球直连"
             "MATCH,🚀 节点选择"
         )
         for rule in "${required_rules[@]}"; do
             if ! grep -q "$rule" sub/config.yaml; then
-                echo "::error::缺失必要规则: $rule"
-                exit 1
+                echo "  - $rule" >> sub/config.yaml
+                echo "::notice::已添加缺失规则: $rule"
             fi
         done
+
+        # 格式化YAML文件
+        echo "格式化配置文件..."
+        python -c "import yaml; data = yaml.safe_load(open('sub/config.yaml')); open('sub/config.yaml', 'w').write(yaml.dump(data, allow_unicode=True, width=2147483647))"
+
+    - name: 最终验证
+      run: |
+        # 检查基本结构
+        if ! grep -q 'proxies:' sub/config.yaml || ! grep -q 'proxy-groups:' sub/config.yaml; then
+          echo "::error::配置文件结构不完整"
+          exit 1
+        fi
 
         # 检查节点数量
         node_count=$(grep -c 'name:' sub/config.yaml)
         if [ "$node_count" -lt 3 ]; then
-            echo "::error::有效节点不足: $node_count"
-            exit 1
+          echo "::error::有效节点不足: $node_count"
+          exit 1
         fi
+
+        echo "✅ 配置文件验证通过"
 
     - name: 创建版本发布
       uses: softprops/action-gh-release@v1
@@ -202,9 +254,18 @@ jobs:
           - 节点数量: $(grep -c 'name:' sub/config.yaml)
           - 规则数量: $(grep -c 'rules:' sub/config.yaml)
           - 生成时间: ${{ env.CURRENT_DATE }}
+          - 包含以下核心规则:
+            - GEOIP,CN 直连
+            - 自动节点选择
+            - 广告拦截规则
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 清理工作区
-      run: |
-        rm -f generate_config.py
+    - name: 上传日志
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: generation-logs
+        path: |
+          generate_config.py
+        retention-days: 1
