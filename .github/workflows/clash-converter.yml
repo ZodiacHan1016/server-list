@@ -38,13 +38,49 @@ jobs:
         import yaml
         import requests
         import json
-        from urllib.parse import urlparse
+        import re
+        from concurrent.futures import ThreadPoolExecutor
+
+        class RuleProcessor:
+            RULE_PATTERN = re.compile(r'^(?P<type>[A-Z-]+),(?P<param>[^,]+),(?P<group>[^,]+)$')
+
+            @classmethod
+            def process_rule(cls, line):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    return None
+
+                # 格式转换处理
+                conversions = {
+                    'IP-CIDR': 'GEOIP',
+                    'FINAL': 'MATCH',
+                    'PROCESS-NAME': 'PROCESS-NAME'
+                }
+                for old, new in conversions.items():
+                    if line.startswith(old):
+                        line = line.replace(old, new, 1)
+
+                # 标准化规则格式
+                match = cls.RULE_PATTERN.match(line)
+                if not match:
+                    return None
+                
+                return f"{match.group('type')},{match.group('param')},{match.group('group')}"
+
+            @classmethod
+            def fetch_rules(cls, url):
+                try:
+                    resp = requests.get(url, timeout=10)
+                    return [cls.process_rule(line) for line in resp.text.splitlines()]
+                except Exception as e:
+                    print(f"规则源加载失败: {url} - {str(e)}")
+                    return []
 
         class ClashGenerator:
             RULE_SOURCES = [
                 "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China.list",
                 "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Global/Global.list",
-                "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/ChinaMedia/ChinaMedia.list"
+                "https://raw.githubusercontent.com/DivineEngine/Profiles/master/Clash/RuleSet/Unbreak.list"
             ]
 
             def __init__(self):
@@ -52,7 +88,6 @@ jobs:
                     "port": 7890,
                     "socks-port": 7891,
                     "mode": "Rule",
-                    "log-level": "info",
                     "proxies": [],
                     "proxy-groups": [
                         {
@@ -69,7 +104,7 @@ jobs:
                     "rules": []
                 }
 
-            def fetch_subscription(self):
+            def load_subscription(self):
                 sub_url = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
                 response = requests.get(sub_url)
                 decoded = base64.b64decode(response.text).decode('utf-8')
@@ -90,32 +125,31 @@ jobs:
                     "network": config.get("net", "tcp")
                 }
 
-            def load_rules(self):
+            def generate_rules(self):
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    results = executor.map(RuleProcessor.fetch_rules, self.RULE_SOURCES)
+                
                 rules = []
-                for url in self.RULE_SOURCES:
-                    try:
-                        response = requests.get(url, timeout=10)
-                        rules.extend([
-                            line.replace("IP-CIDR", "GEOIP")
-                            for line in response.text.splitlines()
-                            if not line.startswith('#') and line.strip()
-                        ])
-                    except Exception as e:
-                        print(f"规则源 {url} 加载失败: {str(e)}")
+                for result in results:
+                    rules.extend([r for r in result if r is not None])
                 
                 # 添加核心规则
-                rules += [
+                core_rules = [
                     "GEOIP,CN,🎯 全球直连",
                     "MATCH,🚀 节点选择"
                 ]
-                return list(dict.fromkeys(rules))  # 去重
+                return list(dict.fromkeys(core_rules + rules))
 
             def generate(self):
-                vmess_links = self.fetch_subscription()
+                # 处理节点
+                vmess_links = self.load_subscription()
                 self.config["proxies"] = [self.parse_vmess(link) for link in vmess_links]
                 self.config["proxy-groups"][0]["proxies"] = [p["name"] for p in self.config["proxies"]]
-                self.config["rules"] = self.load_rules()
-
+                
+                # 处理规则
+                self.config["rules"] = self.generate_rules()
+                
+                # 写入文件
                 with open("sub/config.yaml", "w") as f:
                     yaml.dump(self.config, f, allow_unicode=True, width=2147483647)
 
@@ -128,27 +162,32 @@ jobs:
 
     - name: 验证配置文件
       run: |
-        # 基础结构检查
-        if ! grep -q 'proxies:' sub/config.yaml || ! grep -q 'proxy-groups:' sub/config.yaml; then
-          echo "::error::配置文件结构不完整"
+        # 检查规则格式
+        invalid_rules=$(grep -vE '^[A-Z-]+,[^,]+,[^,]+$' sub/config.yaml | grep -vE '^ |^#|^port:|^socks-port:|^mode:|^proxies:|^proxy-groups:|^rules:' || true)
+        if [ -n "$invalid_rules" ]; then
+          echo "::error::发现无效规则格式:"
+          echo "$invalid_rules"
           exit 1
         fi
 
-        # 节点数量检查
+        # 检查必要规则
+        required_rules=(
+            "GEOIP,CN,🎯 全球直连"
+            "MATCH,🚀 节点选择"
+        )
+        for rule in "${required_rules[@]}"; do
+            if ! grep -q "$rule" sub/config.yaml; then
+                echo "::error::缺失必要规则: $rule"
+                exit 1
+            fi
+        done
+
+        # 检查节点数量
         node_count=$(grep -c 'name:' sub/config.yaml)
         if [ "$node_count" -lt 3 ]; then
-          echo "::error::有效节点不足: $node_count"
-          exit 1
-        fi
-
-        # 规则完整性检查
-        required_rules=("GEOIP,CN" "MATCH")
-        for rule in "${required_rules[@]}"; do
-          if ! grep -q "$rule" sub/config.yaml; then
-            echo "::error::缺失必要规则: $rule"
+            echo "::error::有效节点不足: $node_count"
             exit 1
-          fi
-        done
+        fi
 
     - name: 创建版本发布
       uses: softprops/action-gh-release@v1
@@ -160,12 +199,12 @@ jobs:
         draft: false
         body: |
           自动生成的 Clash 配置文件
-          - 包含 $(grep -c 'name:' sub/config.yaml) 个节点
-          - 最后更新: ${{ env.CURRENT_DATE }}
+          - 节点数量: $(grep -c 'name:' sub/config.yaml)
           - 规则数量: $(grep -c 'rules:' sub/config.yaml)
+          - 生成时间: ${{ env.CURRENT_DATE }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: 清理工作区
       run: |
-        rm -rf nodes.txt generate_config.py
+        rm -f generate_config.py
