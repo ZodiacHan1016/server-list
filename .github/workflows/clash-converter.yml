@@ -1,76 +1,152 @@
-name: Clash Config Builder
+name: Clash Config Builder (Python)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0/6 * * *'  # 
+    - cron: '0 */6 * * *'
 
 jobs:
   build-config:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
       with:
-        submodules: recursive
+        python-version: '3.10'
 
-    - name: Update subconverter
+    - name: Install dependencies
       run: |
-        git submodule update --init --remote utils/subconverter
-        cd utils/subconverter && git restore pref.ini
+        python -m pip install --upgrade pip
+        pip install pyyaml requests
 
-    - name: Decode and prepare subscription
+    - name: Generate Clash config
       run: |
-        curl -sL "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub" | base64 -d > nodes.txt
-        awk '{print "vmess://" $0}' nodes.txt > utils/subconverter/input.txt
+        cat << 'EOF' > generate_config.py
+        import base64
+        import yaml
+        import requests
+        import json
 
-    - name: Configure subconverter
-      run: |
-        sed -i "s/enable_rule_generator=.*/enable_rule_generator=true/" utils/subconverter/config/rule.ini
-        sed -i "s/overwrite_original_rules=.*/overwrite_original_rules=true/" utils/subconverter/config/rule.ini
-        sed -i "s/^enable_insert=.*/enable_insert=true/" utils/subconverter/pref.ini
-        sed -i "s|^insert_url=.*|insert_url=input.txt|" utils/subconverter/pref.ini
-        sed -i "s/^prepend_insert_url=.*/prepend_insert_url=true/" utils/subconverter/pref.ini
-        sed -i "s/^exclude_remarks=.*/exclude_remarks=(到期|剩余流量|时间|官网|产品|平台)/" utils/subconverter/pref.ini
-        sed -i "s/^enable_filter=.*/enable_filter=true/" utils/subconverter/pref.ini
+        def main():
+            # 获取并解码订阅
+            sub_url = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
+            raw_data = requests.get(sub_url).text
+            decoded = base64.b64decode(raw_data).decode('utf-8')
+            
+            # 解析节点
+            proxies = []
+            for line in decoded.splitlines():
+                if line.startswith("vmess://"):
+                    config = parse_vmess(line)
+                    proxies.append(config)
 
-    - name: Generate config
-      run: |
-        cd utils/subconverter
-        chmod +x subconverter-linux-amd64  # 添加执行权限
-        ./subconverter-linux-amd64 \       # 使用正确的文件名
-          --artifact "clash" \
-          --rule "config/rule.ini" \
-          --pref "pref.ini" \
-          --output "../../sub/config.yaml" \
-          --daemon &
-        echo -e "\n# Generated at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> ../../sub/config.yaml
-        echo "# Subconverter version: $(git rev-parse --short HEAD)" >> ../../sub/config.yaml
+            # 构建策略组
+            proxy_groups = [
+                {
+                    "name": "🚀 节点选择",
+                    "type": "select",
+                    "proxies": [p["name"] for p in proxies]
+                },
+                {
+                    "name": "🎯 全球直连",
+                    "type": "select",
+                    "proxies": ["DIRECT"]
+                }
+            ]
+
+            # 获取规则集
+            rules = get_rules()
+
+            # 生成完整配置
+            config = {
+                "port": 7890,
+                "socks-port": 7891,
+                "mode": "Rule",
+                "proxies": proxies,
+                "proxy-groups": proxy_groups,
+                "rules": rules
+            }
+
+            with open("sub/config.yaml", "w") as f:
+                yaml.dump(config, f, allow_unicode=True, width=2147483647)
+
+        def parse_vmess(link):
+            raw = base64.b64decode(link[8:]).decode()
+            config = json.loads(raw)
+            return {
+                "name": config["ps"],
+                "type": "vmess",
+                "server": config["add"],
+                "port": config["port"],
+                "uuid": config["id"],
+                "alterId": config["aid"],
+                "cipher": "auto",
+                "tls": "tls" in config,
+                "network": config.get("net", "tcp")
+            }
+
+        def get_rules():
+            rule_sources = [
+                "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China.list",
+                "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Global/Global.list"
+            ]
+            
+            rules = []
+            for url in rule_sources:
+                resp = requests.get(url)
+                rules.extend([
+                    line.replace("IP-CIDR", "GEOIP") 
+                    for line in resp.text.splitlines() 
+                    if not line.startswith('#')
+                ])
+            
+            # 添加核心规则
+            rules += [
+                "GEOIP,CN,🎯 全球直连",
+                "MATCH,🚀 节点选择"
+            ]
+            return list(dict.fromkeys(rules))  # 去重
+
+        if __name__ == "__main__":
+            main()
+        EOF
+
+        python generate_config.py
 
     - name: Validate config
       run: |
-        if ! grep -q '🚀 节点选择' sub/config.yaml; then
-          echo "::error::代理组生成失败"
+        # 基础验证
+        if ! grep -q 'proxies:' sub/config.yaml; then
+          echo "::error::配置文件结构错误"
           exit 1
         fi
-        if ! grep -q 'GEOIP,CN' sub/config.yaml || ! grep -q 'MATCH' sub/config.yaml; then
-          echo "::error::规则集生成不完整"
-          exit 1
-        fi
-        node_count=$(grep -c 'vmess://' sub/config.yaml)
+
+        # 节点数量检查
+        node_count=$(grep -c 'name:' sub/config.yaml)
         if [ "$node_count" -lt 3 ]; then
-          echo "::error::节点注入数量不足"
+          echo "::error::有效节点不足: $node_count"
           exit 1
         fi
+
+        # 规则完整性检查
+        required_rules=("GEOIP,CN" "MATCH")
+        for rule in "${required_rules[@]}"; do
+          if ! grep -q "$rule" sub/config.yaml; then
+            echo "::error::缺失必要规则: $rule"
+            exit 1
+          fi
+        done
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: clash-config
-        path: |
-          sub/config.yaml
-          utils/subconverter/input.txt
-        retention-days: 3
+        path: sub/config.yaml
 
     - name: Create release
       uses: softprops/action-gh-release@v1
