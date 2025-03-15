@@ -42,7 +42,8 @@ jobs:
           --artifact "clash" \
           --rule "config/rule.ini" \
           --pref "pref.ini" \
-          --output "../../sub/config.yaml"
+          --output "../../sub/config.yaml" \
+          --daemon &
         echo -e "\n# Generated at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> ../../sub/config.yaml
         echo "# Subconverter version: $(git rev-parse --short HEAD)" >> ../../sub/config.yaml
 
