@@ -3,7 +3,7 @@ name: Clash 配置生成器
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # 每6小时运行一次
+    - cron: '0 * * * *'  # 每6小时运行一次
 
 jobs:
   build-config:
