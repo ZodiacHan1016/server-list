@@ -8,11 +8,13 @@ on:
 jobs:
   build-config:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
     - name: 检出代码
       uses: actions/checkout@v4
+      with:
+        submodules: true
 
     - name: 生成时间戳
       id: timestamp
@@ -31,6 +33,24 @@ jobs:
         python -m pip install --upgrade pip
         pip install pyyaml requests
 
+    - name: 获取订阅数据
+      run: |
+        mkdir -p sub
+        curl -sL "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub" -o sub/subscription.txt
+        echo "原始订阅数据大小: $(wc -c < sub/subscription.txt) bytes"
+
+    - name: 解码订阅内容
+      run: |
+        base64 -d sub/subscription.txt > sub/decoded.txt
+        echo "解码后内容行数: $(wc -l < sub/decoded.txt)"
+
+    - name: 更新规则订阅
+      run: |
+        mkdir -p rules
+        wget -qO rules/China.list https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China.list
+        wget -qO rules/Global.list https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Global/Global.list
+        wget -qO rules/Unbreak.list https://raw.githubusercontent.com/DivineEngine/Profiles/master/Clash/RuleSet/Unbreak.list
+
     - name: 生成配置文件
       run: |
         cat << 'EOF' > generate_config.py
@@ -48,51 +68,72 @@ jobs:
         )
 
         class RuleProcessor:
-            RULE_PATTERN = re.compile(
-                r'^(?P<type>DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD|IP-CIDR|GEOIP|MATCH|PROCESS-NAME),'
-                r'(?P<param>[^,]+),'
-                r'(?P<group>[^\s,]+)$'
-            )
+            TYPE_CONVERSIONS = {
+                'IP-CIDR': 'GEOIP',
+                'FINAL': 'MATCH',
+                'SRC-IP-CIDR': 'IP-CIDR',
+                'DST-PORT': 'DST-PORT'
+            }
+
+            VALID_TYPES = [
+                'DOMAIN', 'DOMAIN-SUFFIX', 'DOMAIN-KEYWORD',
+                'IP-CIDR', 'GEOIP', 'MATCH', 'PROCESS-NAME',
+                'DST-PORT', 'SRC-PORT'
+            ]
 
             @classmethod
             def process_rule(cls, line):
                 line = line.strip()
-                if not line or line.startswith('#'):
+                original_line = line
+                line = line.split('#')[0].strip()
+                if not line:
                     return None
 
-                # 格式转换处理
-                conversions = {
-                    'IP-CIDR': 'GEOIP',
-                    'FINAL': 'MATCH'
-                }
-                for old, new in conversions.items():
-                    if line.startswith(old):
-                        line = line.replace(old, new, 1)
+                line = re.sub(r'\s+,\s*', ',', line)
+                line = line.replace('，', ',')
+                line = re.sub(r'([^\s])(DOMAIN|MATCH)', r'\1,\2', line)
 
-                # 标准化规则格式
-                match = cls.RULE_PATTERN.match(line)
-                if not match:
-                    logging.warning(f"过滤无效规则: {line}")
+                parts = [p.strip() for p in line.split(',')]
+                parts = [p for p in parts if p]
+
+                if len(parts) == 2:
+                    if parts[0] == 'MATCH':
+                        parts.append('🚀 节点选择')
+                    else:
+                        parts.append('🎯 全球直连')
+
+                if len(parts) != 3:
+                    logging.warning(f"无法解析规则: {original_line}")
                     return None
-                
-                return f"{match.group('type')},{match.group('param')},{match.group('group')}"
+
+                rule_type, param, group = parts
+                rule_type = cls.TYPE_CONVERSIONS.get(rule_type, rule_type)
+                if rule_type not in cls.VALID_TYPES:
+                    logging.warning(f"无效规则类型: {original_line}")
+                    return None
+
+                param = cls.process_parameter(rule_type, param)
+                group = group.split('#')[0].strip()
+                return f"{rule_type},{param},{group}"
 
             @classmethod
-            def fetch_rules(cls, url):
-                try:
-                    resp = requests.get(url, timeout=10)
-                    return [cls.process_rule(line) for line in resp.text.splitlines()]
-                except Exception as e:
-                    logging.error(f"规则源加载失败: {url} - {str(e)}")
-                    return []
+            def process_parameter(cls, rule_type, param):
+                if rule_type in ['IP-CIDR', 'GEOIP']:
+                    param = param.replace('/', '／').replace('／', '/')
+                    if '/' not in param:
+                        param += '/32' if '.' in param else '/128'
+                elif rule_type in ['DST-PORT', 'SRC-PORT']:
+                    param = param.replace('-', ':')
+                    if ':' not in param:
+                        param += ':' + param
+                return param
+
+            @classmethod
+            def load_rules(cls, file_path):
+                with open(file_path, 'r') as f:
+                    return [cls.process_rule(line) for line in f]
 
         class ClashGenerator:
-            RULE_SOURCES = [
-                "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/China/China.list",
-                "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Clash/Global/Global.list",
-                "https://raw.githubusercontent.com/DivineEngine/Profiles/master/Clash/RuleSet/Unbreak.list"
-            ]
-
             def __init__(self):
                 self.config = {
                     "port": 7890,
@@ -115,20 +156,13 @@ jobs:
                     "rules": []
                 }
 
-            def load_subscription(self):
-                sub_url = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
-                try:
-                    response = requests.get(sub_url, timeout=15)
-                    response.raise_for_status()
-                    decoded = base64.b64decode(response.text).decode('utf-8')
-                    return [line for line in decoded.splitlines() if line.startswith('vmess://')]
-                except Exception as e:
-                    logging.error(f"订阅加载失败: {str(e)}")
-                    return []
+            def load_proxies(self):
+                with open('sub/decoded.txt', 'r') as f:
+                    return [line.strip() for line in f if line.startswith('vmess://')]
 
             def parse_vmess(self, link):
                 try:
-                    config_str = base64.b64decode(link[8:]).decode('utf-8')
+                    config_str = base64.b64decode(link[8:]).decode()
                     config = json.loads(config_str)
                     return {
                         "name": config["ps"].strip(),
@@ -142,102 +176,62 @@ jobs:
                         "network": config.get("net", "tcp")
                     }
                 except Exception as e:
-                    logging.warning(f"解析节点失败: {link[:50]}... - {str(e)}")
+                    logging.warning(f"解析节点失败: {link[:30]}... - {str(e)}")
                     return None
 
-            def generate_rules(self):
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    results = executor.map(RuleProcessor.fetch_rules, self.RULE_SOURCES)
+            def generate(self):
+                # 处理节点
+                vmess_links = self.load_proxies()
+                valid_nodes = [node for node in (self.parse_vmess(link) for link in vmess_links) if node]
+                self.config["proxies"] = valid_nodes
+                self.config["proxy-groups"][0]["proxies"] = [p["name"] for p in valid_nodes]
+
+                # 处理规则
+                with ThreadPoolExecutor() as executor:
+                    rule_files = ['rules/China.list', 'rules/Global.list', 'rules/Unbreak.list']
+                    results = executor.map(RuleProcessor.load_rules, rule_files)
                 
                 rules = []
-                valid_count = 0
-                invalid_count = 0
-                
                 for result in results:
-                    for r in result:
-                        if r is not None:
-                            rules.append(r)
-                            valid_count += 1
-                        else:
-                            invalid_count += 1
+                    rules.extend([r for r in result if r])
                 
                 # 添加核心规则
                 core_rules = [
                     "GEOIP,CN,🎯 全球直连",
                     "MATCH,🚀 节点选择"
                 ]
-                
-                # 最终过滤（二次验证）
-                final_rules = []
-                for rule in core_rules + rules:
-                    if RuleProcessor.RULE_PATTERN.match(rule):
-                        final_rules.append(rule)
-                    else:
-                        logging.warning(f"最终过滤无效规则: {rule}")
-                        invalid_count += 1
-                
-                logging.info(f"规则处理完成: 有效规则 {len(final_rules)} 条, 过滤 {invalid_count} 条无效规则")
-                return list(dict.fromkeys(final_rules))
+                self.config["rules"] = core_rules + rules
 
-            def generate(self):
-                # 处理节点
-                vmess_links = self.load_subscription()
-                valid_nodes = [node for node in (self.parse_vmess(link) for link in vmess_links) if node]
-                self.config["proxies"] = valid_nodes
-                self.config["proxy-groups"][0]["proxies"] = [p["name"] for p in valid_nodes]
-                
-                # 处理规则
-                self.config["rules"] = self.generate_rules()
-                
                 # 写入文件
-                with open("sub/config.yaml", "w") as f:
+                with open('sub/config.yaml', 'w') as f:
                     yaml.dump(self.config, f, allow_unicode=True, width=2147483647)
-                logging.info(f"配置文件生成成功，包含 {len(valid_nodes)} 个节点和 {len(self.config['rules'])} 条规则")
+                logging.info(f"生成成功: {len(valid_nodes)}节点, {len(self.config['rules'])}规则")
 
         if __name__ == "__main__":
-            generator = ClashGenerator()
-            generator.generate()
+            ClashGenerator().generate()
         EOF
 
         python generate_config.py
 
-    - name: 自动修复配置文件
+    - name: 最终验证
       run: |
-        # 过滤无效规则
-        echo "自动修复规则格式..."
-        grep -E '^(DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD|IP-CIDR|GEOIP|MATCH|PROCESS-NAME),[^,]+,[^,]+$' sub/config.yaml > temp_config.yaml
-        mv temp_config.yaml sub/config.yaml
-
-        # 确保必要规则存在
-        required_rules=(
+        # 验证YAML格式
+        python -c "import yaml; yaml.safe_load(open('sub/config.yaml'))"
+        
+        # 检查必要元素
+        required_items=(
+            "proxies"
+            "proxy-groups"
+            "rules"
             "GEOIP,CN,🎯 全球直连"
             "MATCH,🚀 节点选择"
         )
-        for rule in "${required_rules[@]}"; do
-            if ! grep -q "$rule" sub/config.yaml; then
-                echo "  - $rule" >> sub/config.yaml
-                echo "::notice::已添加缺失规则: $rule"
+        for item in "${required_items[@]}"; do
+            if ! grep -q "$item" sub/config.yaml; then
+                echo "::error::缺失必要元素: $item"
+                exit 1
             fi
         done
-
-        # 格式化YAML文件
-        echo "格式化配置文件..."
-        python -c "import yaml; data = yaml.safe_load(open('sub/config.yaml')); open('sub/config.yaml', 'w').write(yaml.dump(data, allow_unicode=True, width=2147483647))"
-
-    - name: 最终验证
-      run: |
-        # 检查基本结构
-        if ! grep -q 'proxies:' sub/config.yaml || ! grep -q 'proxy-groups:' sub/config.yaml; then
-          echo "::error::配置文件结构不完整"
-          exit 1
-        fi
-
-        # 检查节点数量
-        node_count=$(grep -c 'name:' sub/config.yaml)
-        if [ "$node_count" -lt 3 ]; then
-          echo "::error::有效节点不足: $node_count"
-          exit 1
-        fi
 
         echo "✅ 配置文件验证通过"
 
@@ -251,21 +245,17 @@ jobs:
         draft: false
         body: |
           自动生成的 Clash 配置文件
+          - 生成时间: ${{ env.CURRENT_DATE }}
           - 节点数量: $(grep -c 'name:' sub/config.yaml)
           - 规则数量: $(grep -c 'rules:' sub/config.yaml)
-          - 生成时间: ${{ env.CURRENT_DATE }}
-          - 包含以下核心规则:
-            - GEOIP,CN 直连
-            - 自动节点选择
-            - 广告拦截规则
+          - 包含功能:
+            * 自动节点选择
+            * 中国大陆直连
+            * 广告拦截规则
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: 上传日志
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: generation-logs
-        path: |
-          generate_config.py
-        retention-days: 1
+    - name: 清理工作区
+      run: |
+        rm -f sub/subscription.txt sub/decoded.txt
+        rm -rf rules/
